@@ -31,6 +31,7 @@ import json
 import base64
 import time
 import logging
+import shutil
 from pathlib import Path
 
 # ------------------------------------------------------------
@@ -64,6 +65,23 @@ AUTH_TOKEN = os.getenv("MAMBO_AUTH_TOKEN", "").strip()
 # 持久化浏览器数据目录：保留 localStorage(auth_token) 与 cf_clearance，
 # 让第二次以后的运行尽量免登录、免验证。
 USER_DATA_DIR = os.getenv("MAMBO_PROFILE_DIR", str(Path(__file__).resolve().parent / ".profile"))
+
+# 可选：显式指定 Chrome/Chromium 路径。Debian/容器环境常只有 chromium，
+# SeleniumBase UC 自动探测偶尔会拉起后立刻崩溃，显式路径更稳定。
+CHROME_BIN = os.getenv("MAMBO_CHROME_BIN", "").strip()
+
+# 运行在 root/容器/xvfb 时，Chromium 需要这些参数才能稳定启动。
+# 可用 MAMBO_CHROME_ARGS 追加逗号分隔参数。
+DEFAULT_CHROME_ARGS = [
+    "--no-sandbox",
+    "--disable-dev-shm-usage",
+    "--disable-gpu",
+]
+EXTRA_CHROME_ARGS = [
+    arg.strip()
+    for arg in os.getenv("MAMBO_CHROME_ARGS", "").split(",")
+    if arg.strip()
+]
 
 # 登录令牌的独立落盘文件（放在持久化目录内，随 .profile 一起被 actions/cache 复用）。
 # 为什么需要它：Chromium 的 localStorage(leveldb) 是【异步批量落盘】的，UC 浏览器
@@ -113,7 +131,11 @@ def api_call(sb, method, path, body=None):
         xhr.withCredentials = true;
         try { xhr.send(body ? JSON.stringify(body) : null); }
         catch (e) { return JSON.stringify({__error: String(e)}); }
-        return JSON.stringify({__status: xhr.status, __text: xhr.responseText});
+        return JSON.stringify({
+            __status: xhr.status,
+            __text: xhr.responseText,
+            __content_type: xhr.getResponseHeader('Content-Type') || ''
+        });
     """
     raw = sb.execute_script(js, method, path, body)
     try:
@@ -123,11 +145,17 @@ def api_call(sb, method, path, body=None):
     if "__error" in wrapper:
         return wrapper
     text = wrapper.get("__text") or ""
+    is_json = False
     try:
         data = json.loads(text) if text else {}
+        is_json = isinstance(data, dict)
+        if not isinstance(data, dict):
+            data = {"__data": data}
     except Exception:
         data = {"__text": text}
     data["__status"] = wrapper.get("__status")
+    data["__content_type"] = wrapper.get("__content_type") or ""
+    data["__json"] = is_json
     return data
 
 
@@ -190,10 +218,16 @@ def solve_turnstile(sb, max_clicks=3):
 def is_logged_in(sb):
     """通过 /api/auth/me 校验当前登录态是否有效。"""
     me = api_call(sb, "GET", "/api/auth/me")
-    ok = bool(me) and me.get("__status") == 200 and not me.get("__error")
+    if not me or me.get("__error") or me.get("__status") != 200 or not me.get("__json"):
+        return False
+    if me.get("message") or me.get("error"):
+        return False
+    user = me.get("user") or me.get("data") or me
+    ok = isinstance(user, dict) and any(
+        key in user for key in ("id", "userName", "username", "name", "email")
+    )
     if ok:
         # 兼容不同返回结构，尽量取出用户名
-        user = me.get("user") or me
         name = user.get("userName") or user.get("username") or user.get("name") or "已登录用户"
         log.info(f"登录态有效：{name}")
     return ok
@@ -327,6 +361,8 @@ def do_login(sb):
 def get_checkin_status(sb):
     """查询签到状态。返回 (已签到?, 原始数据)。"""
     data = api_call(sb, "GET", "/api/checkin/status")
+    if data.get("__error") or data.get("__status") != 200 or not data.get("__json"):
+        return False, data
     checked = bool(data.get("hasCheckedInToday"))
     return checked, data
 
@@ -395,12 +431,17 @@ def do_checkin(sb):
 # ============================================================
 def build_sb_kwargs():
     """根据显示模式组织 SB() 参数。"""
+    chrome_bin = CHROME_BIN or shutil.which("google-chrome") or shutil.which("chromium")
     kwargs = dict(
         uc=True,                     # Undetected Chrome
         user_data_dir=USER_DATA_DIR, # 持久化 profile
         locale_code="zh-CN",
         ad_block=True,
+        chromium_arg=",".join(DEFAULT_CHROME_ARGS + EXTRA_CHROME_ARGS),
     )
+    if chrome_bin:
+        kwargs["binary_location"] = chrome_bin
+        log.info(f"浏览器路径：{chrome_bin}")
     has_display = bool(os.environ.get("DISPLAY"))
     mode = DISPLAY_MODE
     if mode == "auto":
@@ -415,6 +456,35 @@ def build_sb_kwargs():
     return kwargs
 
 
+def cleanup_profile_locks():
+    """清理上次异常退出留下的 Chromium profile 锁文件。"""
+    profile = Path(USER_DATA_DIR)
+    if not profile.exists():
+        return
+    patterns = [
+        "SingletonLock",
+        "SingletonCookie",
+        "SingletonSocket",
+        "LOCK",
+        ".org.chromium.Chromium.*",
+    ]
+    removed = 0
+    for pattern in patterns:
+        for path in profile.rglob(pattern):
+            try:
+                if path.is_dir():
+                    shutil.rmtree(path)
+                else:
+                    path.unlink()
+                removed += 1
+            except FileNotFoundError:
+                pass
+            except Exception as e:
+                log.debug(f"清理 profile 锁失败（忽略）：{path}: {e}")
+    if removed:
+        log.info(f"已清理 Chromium profile 残留锁文件：{removed} 个")
+
+
 def main():
     if not AUTH_TOKEN and not load_token() and not (USERNAME and PASSWORD):
         sys.exit(
@@ -424,6 +494,7 @@ def main():
 
     log.info(f"目标站点：{BASE_URL}")
     log.info(f"持久化目录：{USER_DATA_DIR}")
+    cleanup_profile_locks()
 
     with SB(**build_sb_kwargs()) as sb:
         # 先打开首页，建立站点上下文（同源 + 可读 localStorage）
@@ -466,6 +537,7 @@ def export_token():
     """
     log.info(f"目标站点：{BASE_URL}")
     log.info(f"持久化目录：{USER_DATA_DIR}")
+    cleanup_profile_locks()
     with SB(**build_sb_kwargs()) as sb:
         sb.uc_open_with_reconnect(f"{BASE_URL}/", reconnect_time=4)
         sb.sleep(1.5)

@@ -72,8 +72,8 @@ jobs:
           MAMBO_PASSWORD: ${{ secrets.MAMBO_PASSWORD }}
           MAMBO_AUTH_TOKEN: ${{ secrets.MAMBO_AUTH_TOKEN }}
           MAMBO_DISPLAY: xvfb
-        # 【重点修正】：使用 xvfb-run 动态分配虚拟屏幕并执行脚本
-        run: xvfb-run --auto-servernum python checkin.py
+        # 脚本内部会按 MAMBO_DISPLAY=xvfb 启动虚拟显示；避免外层再套一层 xvfb-run。
+        run: python checkin.py
 
       - name: 保存持久化浏览器 profile
         if: always()            # 即便签到失败也保存，尽量留住已刷新的登录态供下次复用
