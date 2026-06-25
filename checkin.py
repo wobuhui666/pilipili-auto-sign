@@ -342,11 +342,9 @@ def do_login(sb):
     # 以【登录态】为最终判据（不依赖 Turnstile token 检测，更可靠）
     deadline = time.time() + LOGIN_TIMEOUT
     while time.time() < deadline:
-        token = sb.execute_script(
-            "return localStorage.getItem('auth_token') || sessionStorage.getItem('auth_token');"
-        )
-        if token and is_logged_in(sb):
+        if is_logged_in(sb):
             log.info("登录成功 ✓")
+            save_token(sb)
             return True
         sb.sleep(2)
     raise RuntimeError(
